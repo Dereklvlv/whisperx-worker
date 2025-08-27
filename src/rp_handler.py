@@ -16,17 +16,20 @@ from huggingface_hub import login, whoami
 import torch
 import numpy as np
 from dotenv import load_dotenv, find_dotenv
+import base64
+from pathlib import Path
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 from speechbrain.pretrained import EncoderClassifier # type: ignore
 
-def spk_embed(wave_16k_mono: np.ndarray) -> np.ndarray:
-    wav = torch.tensor(wave_16k_mono).unsqueeze(0).to(device)
-    return ecapa.encode_batch(wav).squeeze(0).cpu().numpy()
-
-def to_numpy(x):
-    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+# Removed unused helpers that referenced undefined 'ecapa'
+# def spk_embed(wave_16k_mono: np.ndarray) -> np.ndarray:
+#     wav = torch.tensor(wave_16k_mono).unsqueeze(0).to(device)
+#     return ecapa.encode_batch(wav).squeeze(0).cpu().numpy()
+#
+# def to_numpy(x):
+#     return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -93,6 +96,58 @@ logger.addHandler(file_handler)
 MODEL = Predictor()
 MODEL.setup()
 
+def ensure_job_dir(job_id: str, subdir: str = "input", jobs_directory: str = "/jobs") -> str:
+    """Create and return a job subdirectory path."""
+    dir_path = os.path.join(jobs_directory, job_id, subdir)
+    os.makedirs(dir_path, exist_ok=True)
+    return dir_path
+
+def _strip_data_uri(b64_str: str) -> str:
+    """Remove data URI header if present."""
+    if b64_str.lstrip().startswith("data:") and "," in b64_str:
+        return b64_str.split(",", 1)[1]
+    return b64_str
+
+def write_b64_to_file(b64_str: str, dest_path: str) -> int:
+    """Append-decoding a single base64 string to file. Returns bytes written."""
+    data = base64.b64decode(_strip_data_uri(b64_str), validate=False)
+    with open(dest_path, "ab") as f:
+        f.write(data)
+    return len(data)
+
+def write_b64_chunks_to_file(chunks: list, dest_path: str) -> int:
+    """Write list of base64 chunks to file, returns total bytes written."""
+    # reset file
+    with open(dest_path, "wb") as f:
+        pass
+    total = 0
+    for ch in chunks:
+        total += write_b64_to_file(ch, dest_path)
+    return total
+
+def materialize_sample_b64(sample: dict, speakers_dir: str, index: int) -> str | None:
+    """If sample contains base64, write to a file and set sample['file_path']."""
+    ext = sample.get("file_extension") or sample.get("extension") or ".wav"
+    if not isinstance(ext, str):
+        ext = ".wav"
+    if not ext.startswith("."):
+        ext = "." + ext
+    name = sample.get("name") or f"speaker_{index}"
+    safe = "".join(c if (c.isalnum() or c in ("-", "_")) else "_" for c in name)
+    dest = os.path.join(speakers_dir, f"{safe}{ext}")
+    if sample.get("b64_chunks"):
+        write_b64_chunks_to_file(sample["b64_chunks"], dest)
+        sample["file_path"] = dest
+        sample.setdefault("name", name)
+        return dest
+    if sample.get("b64"):
+        write_b64_chunks_to_file([sample["b64"]], dest)
+        sample["file_path"] = dest
+        sample.setdefault("name", name)
+        return dest
+    return None
+
+
 def cleanup_job_files(job_id, jobs_directory='/jobs'):
     job_path = os.path.join(jobs_directory, job_id)
     if os.path.exists(job_path):
@@ -117,19 +172,47 @@ def run(job):
     if "errors" in validated:
         return {"error": validated["errors"]}
 
-    # ------------- 1) download primary audio ------------------------
+    # ------------- 1) load/assemble primary audio -------------------
+    audio_file_path = None
     try:
-        audio_file_path = download_files_from_urls(job_id,
-                                                   [job_input["audio_file"]])[0]
-        logger.debug(f"Audio downloaded → {audio_file_path}")
+        if job_input.get("audio_file"):
+            audio_file_path = download_files_from_urls(job_id, [job_input["audio_file"]])[0]
+            logger.debug(f"Audio downloaded → {audio_file_path}")
+        elif job_input.get("audio_b64_chunks") or job_input.get("audio_b64"):
+            input_dir = ensure_job_dir(job_id, "input")
+            ext = job_input.get("audio_extension", ".wav") or ".wav"
+            if not isinstance(ext, str):
+                ext = ".wav"
+            if not ext.startswith("."):
+                ext = "." + ext
+            audio_file_path = os.path.join(input_dir, f"audio{ext}")
+            if job_input.get("audio_b64_chunks"):
+                total = write_b64_chunks_to_file(job_input["audio_b64_chunks"], audio_file_path)
+                logger.info(f"Audio assembled from {len(job_input['audio_b64_chunks'])} base64 chunks → {audio_file_path} ({total} bytes)")
+            else:
+                total = write_b64_chunks_to_file([job_input["audio_b64"]], audio_file_path)
+                logger.info(f"Audio assembled from single base64 → {audio_file_path} ({total} bytes)")
+        else:
+            return {"error": "No audio provided. Supply 'audio_file' URL or 'audio_b64'/'audio_b64_chunks'."}
     except Exception as e:
-        logger.error("Audio download failed", exc_info=True)
-        return {"error": f"audio download: {e}"}
+        logger.error("Audio input preparation failed", exc_info=True)
+        return {"error": f"audio input: {e}"}
 
-    # ------------- 2) download speaker profiles (optional) ----------
+    # ------------- 2) speaker profiles (optional, allow base64) -----
     speaker_profiles = job_input.get("speaker_samples", [])
     embeddings = {}
     if speaker_profiles:
+        # materialize any base64 speaker samples to files
+        try:
+            speakers_dir = ensure_job_dir(job_id, "speakers")
+            for idx, sample in enumerate(speaker_profiles):
+                if isinstance(sample, dict) and (sample.get("b64_chunks") or sample.get("b64")):
+                    path = materialize_sample_b64(sample, speakers_dir, idx)
+                    if path:
+                        logger.debug(f"Speaker sample materialized → {path}")
+        except Exception as e:
+            logger.error("Failed to materialize speaker samples", exc_info=True)
+            error_log.append(f"speaker sample materialization: {e}")
         try:
             embeddings = load_known_speakers_from_samples(
                 speaker_profiles,
@@ -138,21 +221,7 @@ def run(job):
             logger.info(f"Enrolled {len(embeddings)} speaker profiles successfully.")
         except Exception as e:
             logger.error("Enrollment failed", exc_info=True)
-            output_dict["warning"] = f"Enrollment skipped: {e}"
-        # urls = [s.get("url") for s in speaker_profiles if s.get("url")]
-        # if urls:
-        #     try:
-        #         local_paths = download_files_from_urls(job_id, urls)
-        #         for s, path in zip(speaker_profiles, local_paths):
-        #             s["file_path"] = path  # mutate in-place
-        #             logger.debug(f"Profile {s.get('name')} → {path}")
-
-        #         # Now enroll profiles using the updated speaker_profiles with local file paths
-        #         embeddings = enroll_profiles(speaker_profiles)
-        #         logger.info(f"Enrolled {len(embeddings)} speaker profiles successfully.")
-        #     except Exception as e:
-        #         logger.error("Enrollment failed", exc_info=True)
-        #         output_dict["warning"] = f"Enrollment skipped: {e}"
+            error_log.append(f"Enrollment skipped: {e}")
     # ----------------------------------------------------------------
 
     # ------------- 3) call WhisperX / VAD / diarization -------------
@@ -194,7 +263,6 @@ def run(job):
                 enrolled=embeddings,
                 threshold=0.1  # Adjust threshold as needed
             )
-            #output_dict["segments"] = segments_with_speakers
             segments_with_final_labels = relabel_speakers_by_avg_similarity(segments_with_speakers)
             output_dict["segments"] = segments_with_final_labels
             logger.info("Speaker identification completed successfully.")
@@ -210,6 +278,9 @@ def run(job):
         cleanup_job_files(job_id)
     except Exception as e:
         logger.warning(f"Cleanup issue: {e}", exc_info=True)
+
+    if error_log:
+        output_dict["warnings"] = error_log
 
     return output_dict
 
@@ -253,7 +324,7 @@ runpod.serverless.start({"handler": run})
 #         rp_cleanup.clean(["input_objects"])
 #         cleanup_job_files(job_id)
 #     except Exception as e:
-#         logger.warning(f"Cleanup issue: {e}", exc_info=True)
+#         logger.warning(f"Cleanup issue: {e}")
 
 #         # If you have any errors, attach them to the output
 #     if error_log:

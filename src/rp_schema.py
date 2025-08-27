@@ -1,7 +1,23 @@
 INPUT_VALIDATIONS = {
     'audio_file': {
         'type': str,
-        'required': True
+        'required': False,
+        'default': None
+    },
+    'audio_b64': {
+        'type': str,
+        'required': False,
+        'default': None
+    },
+    'audio_b64_chunks': {
+        'type': list,
+        'required': False,
+        'default': None
+    },
+    'audio_extension': {
+        'type': str,
+        'required': False,
+        'default': '.wav'
     },
     'language': {
         'type': str,
