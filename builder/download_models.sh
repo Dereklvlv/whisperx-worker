@@ -71,10 +71,8 @@ except Exception as e:
 snapshot_download(repo_id='speechbrain/spkrec-ecapa-voxceleb')
 
 # Optionally download PyAnnote models if HF_TOKEN is set
-if hf_token:
-    snapshot_download(repo_id='pyannote/embedding', use_auth_token=hf_token)
-    snapshot_download(repo_id='pyannote/speaker-diarization-2.1', use_auth_token=hf_token)
-else:
-    print('WARNING: HF_TOKEN not set, skipping pyannote models download')
-"
+
+snapshot_download(repo_id='dereklvlv/embedding')
+snapshot_download(repo_id='syvai/speaker-diarization-3.1')
+
 echo "All models downloaded successfully."
