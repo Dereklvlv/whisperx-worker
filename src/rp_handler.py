@@ -36,6 +36,7 @@ logger.setLevel(logging.DEBUG)
 # Grab the HF_TOKEN from environment
 raw_token = os.environ.get("HF_TOKEN", "")
 hf_token = raw_token.strip()
+print("Token: ", hf_token)
 
 if not hf_token.startswith("hf_"):
     print(f"Token malformed or missing 'hf_' prefix. Forcing correction...")
