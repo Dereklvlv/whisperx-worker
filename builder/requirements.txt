@@ -4,7 +4,7 @@ torch==2.1.0+cu121
 torchaudio==2.1.0+cu121
 
 # ---------- main libs ----------
-whisperx @ git+https://github.com/m-bain/whisperx.git@8f00339af7dcc9705ef40d97a1f40764b7cf555
+whisperx @ git+https://github.com/m-bain/whisperx.git@58f00339af7dcc9705ef49d97a1f40764b7cf555
 pyannote.audio==3.1.1                # embedded/diarization
 speechbrain==0.5.16                  # ECAPA embedding that whisperx uses
 ctranslate2==4.3.1                   # used by whisperx
