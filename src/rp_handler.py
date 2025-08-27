@@ -9,8 +9,6 @@ HF_TOKEN = os.getenv("HF_TOKEN")#
 
 ######SETTING HF_TOKENT#############
 
-from speaker_profiles import load_embeddings, relabel  # top of file
-from speaker_processing import process_diarized_output,enroll_profiles, identify_speakers_on_segments, load_known_speakers_from_samples, identify_speaker, relabel_speakers_by_avg_similarity
 import logging
 from huggingface_hub import login, whoami
 import torch
@@ -55,6 +53,9 @@ if hf_token:
 else:
     logger.warning("No Hugging Face token found in HF_TOKEN environment variable.")
 ##############
+
+from speaker_profiles import load_embeddings, relabel  # top of file
+from speaker_processing import process_diarized_output,enroll_profiles, identify_speakers_on_segments, load_known_speakers_from_samples, identify_speaker, relabel_speakers_by_avg_similarity
 
 import shutil
 import runpod
