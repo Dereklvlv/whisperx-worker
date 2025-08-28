@@ -50,7 +50,7 @@ if hf_token:
         user = whoami(token=hf_token)
         logger.info(f"Hugging Face Authenticated as: {user['name']}")
     except Exception as e:
-        logger.error(" Failed to authenticate with Hugging Face", exc_info=True)
+        logger.error(f" Failed to authenticate with Hugging Face. Token: {hf_token}", exc_info=True)
 else:
     logger.warning("No Hugging Face token found in HF_TOKEN environment variable.")
 ##############
