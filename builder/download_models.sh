@@ -75,4 +75,4 @@ snapshot_download(repo_id='speechbrain/spkrec-ecapa-voxceleb')
 snapshot_download(repo_id='dereklvlv/embedding')
 snapshot_download(repo_id='syvai/speaker-diarization-3.1')
 
-echo "All models downloaded successfully."
+
