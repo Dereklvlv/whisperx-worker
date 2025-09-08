@@ -1,4 +1,3 @@
-# at top of rp_handler.py (or speaker_processing.py)
 from dotenv import load_dotenv, find_dotenv
 import os
 
@@ -16,6 +15,7 @@ from huggingface_hub import login, whoami
 import torch
 import numpy as np
 from dotenv import load_dotenv, find_dotenv
+from typing import Optional
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -93,6 +93,21 @@ logger.addHandler(file_handler)
 MODEL = Predictor()
 MODEL.setup()
 
+# --- New: helper to create a local audio file from base64 when provided ---
+def _write_base64_audio(job_id: str, audio_b64: str, filename: Optional[str]) -> str:
+    import base64
+    # Ensure a safe filename
+    safe_name = (filename or "audio").replace("/", "_").replace("\\", "_")
+    if not ("." in safe_name):
+        safe_name += ".bin"
+    job_dir = os.path.join("/jobs", job_id)
+    os.makedirs(job_dir, exist_ok=True)
+    out_path = os.path.join(job_dir, safe_name)
+    with open(out_path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+    return out_path
+
+
 def cleanup_job_files(job_id, jobs_directory='/jobs'):
     job_path = os.path.join(jobs_directory, job_id)
     if os.path.exists(job_path):
@@ -117,14 +132,22 @@ def run(job):
     if "errors" in validated:
         return {"error": validated["errors"]}
 
-    # ------------- 1) download primary audio ------------------------
+    # ------------- 1) obtain primary audio --------------------------
+    # Prefer base64 if provided, else fall back to URL download
+    audio_file_path = None
     try:
-        audio_file_path = download_files_from_urls(job_id,
-                                                   [job_input["audio_file"]])[0]
-        logger.debug(f"Audio downloaded → {audio_file_path}")
+        audio_b64 = job_input.get("audio_base64")
+        audio_fname = job_input.get("audio_filename")
+        if audio_b64:
+            audio_file_path = _write_base64_audio(job_id, audio_b64, audio_fname)
+            logger.debug(f"Audio received as base64 → {audio_file_path}")
+        else:
+            audio_file_path = download_files_from_urls(job_id,
+                                                       [job_input["audio_file"]])[0]
+            logger.debug(f"Audio downloaded → {audio_file_path}")
     except Exception as e:
-        logger.error("Audio download failed", exc_info=True)
-        return {"error": f"audio download: {e}"}
+        logger.error("Audio acquisition failed", exc_info=True)
+        return {"error": f"audio acquisition: {e}"}
 
     # ------------- 2) download speaker profiles (optional) ----------
     speaker_profiles = job_input.get("speaker_samples", [])
