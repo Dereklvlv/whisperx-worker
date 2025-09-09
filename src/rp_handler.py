@@ -30,7 +30,7 @@ def to_numpy(x):
 
 # Set up logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Grab the HF_TOKEN from environment
 raw_token = os.environ.get("HF_TOKEN", "")
@@ -63,11 +63,12 @@ import os
 import copy
 import logging
 import sys
+import json
 # Create a custom logger
 logger = logging.getLogger("rp_handler")
-logger.setLevel(logging.DEBUG)  # capture everything at DEBUG or above
+logger.setLevel(logging.INFO)  # show INFO and above in console
 
-# Create console handler and set level to DEBUG
+# Create console handler and set level to INFO
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter(
@@ -93,12 +94,11 @@ logger.addHandler(file_handler)
 MODEL = Predictor()
 MODEL.setup()
 
-# --- New: helper to create a local audio file from base64 when provided ---
+# Re-add helpers used in run()
 def _write_base64_audio(job_id: str, audio_b64: str, filename: Optional[str]) -> str:
     import base64
-    # Ensure a safe filename
     safe_name = (filename or "audio").replace("/", "_").replace("\\", "_")
-    if not ("." in safe_name):
+    if "." not in safe_name:
         safe_name += ".bin"
     job_dir = os.path.join("/jobs", job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -119,17 +119,56 @@ def cleanup_job_files(job_id, jobs_directory='/jobs'):
     else:
         logger.debug(f"Job directory not found: {job_path}")
 
-# --------------------------------------------------------------------
-# main serverless entry-point
-# --------------------------------------------------------------------
-error_log = []
+# --- JSON sanitizer to ensure valid, serializable output ---
+import math
+from typing import Any
+
+def _to_jsonable(obj: Any):
+    if isinstance(obj, dict):
+        return {k: _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, np.generic):
+        obj = obj.item()
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (np.ndarray,)):
+        return _to_jsonable(obj.tolist())
+    if isinstance(obj, (int, str, bool)) or obj is None:
+        return obj
+    # Fallback: try to cast to string
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+def _has_bad_numbers(v) -> bool:
+    if isinstance(v, float):
+        return math.isnan(v) or math.isinf(v)
+    if isinstance(v, dict):
+        return any(_has_bad_numbers(x) for x in v.values())
+    if isinstance(v, (list, tuple)):
+        return any(_has_bad_numbers(x) for x in v)
+    return False
+
+# Increase console verbosity to DEBUG
+# for h in logger.handlers:
+#     if isinstance(h, logging.StreamHandler):
+#         h.setLevel(logging.DEBUG)
+
 def run(job):
     job_id     = job["id"]
     job_input  = job["input"]
 
+    logger.info(f"Job started: {job_id}")
+    logger.info(f"Input keys: {list(job_input.keys())}")
+
     # ------------- validate basic schema ----------------------------
     validated = validate(job_input, INPUT_VALIDATIONS)
     if "errors" in validated:
+        logger.error(f"Validation errors: {validated['errors']}")
         return {"error": validated["errors"]}
 
     # ------------- 1) obtain primary audio --------------------------
@@ -139,20 +178,23 @@ def run(job):
         audio_b64 = job_input.get("audio_base64")
         audio_fname = job_input.get("audio_filename")
         if audio_b64:
+            logger.info(f"Using audio_base64 input; filename={audio_fname or 'N/A'}, length={len(audio_b64)} chars")
             audio_file_path = _write_base64_audio(job_id, audio_b64, audio_fname)
-            logger.debug(f"Audio received as base64 → {audio_file_path}")
+            logger.info(f"Audio written to: {audio_file_path}")
         else:
-            audio_file_path = download_files_from_urls(job_id,
-                                                       [job_input["audio_file"]])[0]
-            logger.debug(f"Audio downloaded → {audio_file_path}")
+            src_url = job_input.get("audio_file")
+            logger.info(f"Downloading audio from URL: {src_url}")
+            audio_file_path = download_files_from_urls(job_id, [src_url])[0]
+            logger.info(f"Audio downloaded to: {audio_file_path}")
     except Exception as e:
         logger.error("Audio acquisition failed", exc_info=True)
         return {"error": f"audio acquisition: {e}"}
 
-    # ------------- 2) download speaker profiles (optional) ----------
+    # ------------- 2) download/enroll speaker profiles (optional) ---
     speaker_profiles = job_input.get("speaker_samples", [])
     embeddings = {}
     if speaker_profiles:
+        logger.info(f"Enrollment requested for {len(speaker_profiles)} profiles")
         try:
             embeddings = load_known_speakers_from_samples(
                 speaker_profiles,
@@ -161,21 +203,8 @@ def run(job):
             logger.info(f"Enrolled {len(embeddings)} speaker profiles successfully.")
         except Exception as e:
             logger.error("Enrollment failed", exc_info=True)
-            output_dict["warning"] = f"Enrollment skipped: {e}"
-        # urls = [s.get("url") for s in speaker_profiles if s.get("url")]
-        # if urls:
-        #     try:
-        #         local_paths = download_files_from_urls(job_id, urls)
-        #         for s, path in zip(speaker_profiles, local_paths):
-        #             s["file_path"] = path  # mutate in-place
-        #             logger.debug(f"Profile {s.get('name')} → {path}")
+            logger.warning(f"Enrollment skipped: {e}")
 
-        #         # Now enroll profiles using the updated speaker_profiles with local file paths
-        #         embeddings = enroll_profiles(speaker_profiles)
-        #         logger.info(f"Enrolled {len(embeddings)} speaker profiles successfully.")
-        #     except Exception as e:
-        #         logger.error("Enrollment failed", exc_info=True)
-        #         output_dict["warning"] = f"Enrollment skipped: {e}"
     # ----------------------------------------------------------------
 
     # ------------- 3) call WhisperX / VAD / diarization -------------
@@ -197,91 +226,76 @@ def run(job):
         "debug"                    : job_input.get("debug", False),
     }
 
+    logger.info("Starting prediction...")
     try:
         result = MODEL.predict(**predict_input)             # <-- heavy job
     except Exception as e:
         logger.error("WhisperX prediction failed", exc_info=True)
         return {"error": f"prediction: {e}"}
+    logger.info("Prediction completed.")
+
+    # Summaries
+    try:
+        seg_count = len(getattr(result, 'segments', []) or [])
+        logger.info(f"Detected language: {getattr(result, 'detected_language', None)}; segments: {seg_count}")
+        raw_out = {"segments": getattr(result, 'segments', []), "detected_language": getattr(result, 'detected_language', None)}
+        # quick size estimate with default=str
+        size_bytes = len(json.dumps(raw_out, default=str).encode("utf-8"))
+        logger.info(f"Estimated output size (pre-sanitize): {size_bytes} bytes")
+        if _has_bad_numbers(raw_out):
+            logger.info("Found NaN/Inf in output before sanitize.")
+    except Exception:
+        logger.warning("Failed to summarize prediction output.", exc_info=True)
 
     output_dict = {
         "segments"         : result.segments,
         "detected_language": result.detected_language
     }
+
+    # Sanitize output to valid JSON
+    try:
+        logger.info("Sanitizing output for JSON compliance...")
+        output_dict = _to_jsonable(output_dict)
+        # Confirm strict JSON
+        json.dumps(output_dict, allow_nan=False)
+        logger.info("Sanitization complete.")
+    except Exception:
+        logger.error("Output sanitization failed.", exc_info=True)
+
     # ------------------------------------------------embedding-info----------------
     # 4) speaker verification (optional)
     if embeddings:
         try:
+            logger.info("Running speaker identification on segments...")
             segments_with_speakers = identify_speakers_on_segments(
                 segments=output_dict["segments"],
                 audio_path=audio_file_path,
                 enrolled=embeddings,
                 threshold=0.1  # Adjust threshold as needed
             )
-            #output_dict["segments"] = segments_with_speakers
             segments_with_final_labels = relabel_speakers_by_avg_similarity(segments_with_speakers)
             output_dict["segments"] = segments_with_final_labels
-            logger.info("Speaker identification completed successfully.")
+            logger.info("Speaker identification completed.")
         except Exception as e:
             logger.error("Speaker identification failed", exc_info=True)
-            output_dict["warning"] = f"Speaker identification skipped: {e}"
+            # preserve primary output; add warning key
+            try:
+                if isinstance(output_dict, dict):
+                    output_dict["warning"] = f"Speaker identification skipped: {e}"
+            except Exception:
+                pass
     else:
         logger.info("No enrolled embeddings available; skipping speaker identification.")
 
-    # 4-Cleanup and return output_dict normally
+    # 5) cleanup and return
     try:
         rp_cleanup.clean(["input_objects"])
         cleanup_job_files(job_id)
+        logger.info("Cleanup complete.")
     except Exception as e:
         logger.warning(f"Cleanup issue: {e}", exc_info=True)
 
+    logger.info("Returning output to RunPod (job-done).")
     return output_dict
 
 runpod.serverless.start({"handler": run})
-
-
-#     embeddings = {} # ensure the name is always bound
-#     if job_input.get("speaker_verification", True):
-#         logger.info(f"Speaker-verification requested: True")
-#         try:
-#             embeddings = load_known_speakers_from_samples(
-#                 speaker_profiles,
-#                 huggingface_access_token=predict_input["huggingface_access_token"]
-#             )
-#             logger.info(f"  • Enrolled {len(embeddings)} profiles")
-#         except Exception as e:
-#             logger.error("Failed loading speaker profiles", exc_info=True)
-#             output_dict["warning"] = f"enrollment skipped: {e}"
-
-#         embedding_log_data = None  # Initialize here to avoid UnboundLocalError
-
-#         if embeddings:  # only attempt verification if we actually got something
-#             try:
-#                 output_dict, embedding_log_data = process_diarized_output(
-#                     output_dict,
-#                     audio_file_path,
-#                     embeddings,
-#                     huggingface_access_token=job_input.get("huggingface_access_token"),
-#                     return_logs=False # <-- set to True for debugging
-#             except Exception as e:
-#                 logger.error("Error during speaker verification", exc_info=True)
-#                 output_dict["warning"] = f"verification skipped: {e}"
-#         else:
-#             logger.info("No embeddings to verify against; skipping verification step")
-
-#     if embedding_log_data:
-#         output_dict["embedding_logs"] = embedding_log_data
-
-#     # 5) cleanup
-#     try:
-#         rp_cleanup.clean(["input_objects"])
-#         cleanup_job_files(job_id)
-#     except Exception as e:
-#         logger.warning(f"Cleanup issue: {e}", exc_info=True)
-
-#         # If you have any errors, attach them to the output
-#     if error_log:
-#         output_dict["error_log"] = "\n".join(error_log)
-
-#     return output_dict
-
-# runpod.serverless.start({"handler": run})
